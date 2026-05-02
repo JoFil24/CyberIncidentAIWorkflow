@@ -6,7 +6,105 @@ from pathlib import Path
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import LabelEncoder
 import os
+
+TRAINING_DATA_PATH = Path(__file__).parent / "Datasets" / "part-00000-0af89d10-df53-44fd-b124-a8a496fd5023-c000(2).csv"
+EXCLUDE_COLUMNS = {"dest_ip", "src_ip", "uid", "community_id", "datetime", "ts"}
+LOGISTIC_MODEL_PATH = Path(__file__).parent / "Models" / "siem_logistic_model-3.joblib"
+DECISION_TREE_MODEL_PATH = Path(__file__).parent / "Models" / "decision_tree_model.joblib"
+RANDOM_FOREST_MODEL_PATH = Path(__file__).parent / "Models" / "trained_ml_model_random_forest_2.joblib"
+
+
+def engineer_features(df):
+    """Apply feature engineering to match the training pipeline"""
+    df = df.copy()
+    
+    # Total packets and bytes
+    df['total_pkts'] = df['orig_pkts'] + df['resp_pkts']
+    df['total_bytes'] = df['orig_bytes'] + df['resp_bytes']
+    
+    # Packet and byte ratios (handling division by zero)
+    df['pkt_ratio'] = df['resp_pkts'] / df['total_pkts'].replace(0, np.nan)
+    df['byte_ratio'] = df['resp_bytes'] / df['total_bytes'].replace(0, np.nan)
+    df[['pkt_ratio', 'byte_ratio']] = df[['pkt_ratio', 'byte_ratio']].fillna(0)
+    
+    # Packet and byte rates (handling division by zero and infinite values)
+    df['pkt_rate'] = df['total_pkts'] / df['duration'].replace(0, np.nan)
+    df['byte_rate'] = df['total_bytes'] / df['duration'].replace(0, np.nan)
+    df[['pkt_rate', 'byte_rate']] = df[['pkt_rate', 'byte_rate']].replace([np.inf, -np.inf], 0).fillna(0)
+    
+    return df
+
+
+def build_decision_tree_encoders():
+    df = pd.read_csv(TRAINING_DATA_PATH)
+    if 'mitre_attack_tactics' in df.columns:
+        df = df.drop(columns=['mitre_attack_tactics'])
+    df = df.drop(columns=[col for col in EXCLUDE_COLUMNS if col in df.columns], errors='ignore')
+
+    for col in df.columns:
+        if df[col].dtype == object:
+            converted = pd.to_numeric(df[col], errors='coerce')
+            if converted.notna().sum() > len(df) * 0.75:
+                df[col] = converted
+
+    df = engineer_features(df)
+    encoders = {}
+    for col in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_bool_dtype(df[col]):
+            encoder = LabelEncoder()
+            encoder.fit(df[col].astype(str))
+            encoders[col] = encoder
+    return encoders
+
+
+DECISION_TREE_ENCODERS = build_decision_tree_encoders()
+
+
+def preprocess_for_logistic(df):
+    df = df.copy()
+    if 'mitre_attack_tactics' in df.columns:
+        df = df.drop(columns=['mitre_attack_tactics'])
+    df = df.drop(columns=[col for col in EXCLUDE_COLUMNS if col in df.columns], errors='ignore')
+    df = engineer_features(df)
+    return df
+
+
+def preprocess_for_decision_tree(df):
+    df = df.copy()
+    if 'mitre_attack_tactics' in df.columns:
+        df = df.drop(columns=['mitre_attack_tactics'])
+    df = df.drop(columns=[col for col in EXCLUDE_COLUMNS if col in df.columns], errors='ignore')
+
+    for col in df.columns:
+        if df[col].dtype == object:
+            converted = pd.to_numeric(df[col], errors='coerce')
+            if converted.notna().sum() > len(df) * 0.75:
+                df[col] = converted
+
+    df = engineer_features(df)
+
+    for col, encoder in DECISION_TREE_ENCODERS.items():
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+            unseen = set(df[col].unique()) - set(encoder.classes_)
+            if unseen:
+                raise ValueError(f"Unseen label values for column '{col}': {sorted(unseen)}")
+            df[col] = encoder.transform(df[col])
+
+    return df
+
+
+def preprocess_for_random_forest(df):
+    """Preprocess for random forest (Pipeline handles its own encoding)"""
+    df = df.copy()
+    if 'mitre_attack_tactics' in df.columns:
+        df = df.drop(columns=['mitre_attack_tactics'])
+    #df = df.drop(columns=[col for col in EXCLUDE_COLUMNS if col in df.columns], errors='ignore')
+    df = engineer_features(df)
+    return df
+
 
 app = Flask(__name__)
 
@@ -18,9 +116,12 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 # Create upload folder if it doesn't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Load the trained model
-MODEL_PATH = Path(__file__).parent / "siem_logistic_model.joblib"
-model = joblib.load(MODEL_PATH)
+# Load trained models
+logistic_model = joblib.load(LOGISTIC_MODEL_PATH)
+decision_tree_model = joblib.load(DECISION_TREE_MODEL_PATH)
+random_forest_model = joblib.load(RANDOM_FOREST_MODEL_PATH)
+# Keep a default model alias for existing model-info behavior
+model = logistic_model
 
 @app.route('/')
 def index():
@@ -47,32 +148,58 @@ def upload_file():
         
         # Load the CSV
         df = pd.read_csv(filepath)
+        df_examples = df.copy()
         
         # Remove target column if present
         if 'mitre_attack_tactics' in df.columns:
             df = df.drop('mitre_attack_tactics', axis=1)
         
+        # Preprocess for each model
+        logistic_df = preprocess_for_logistic(df)
+        decision_df = preprocess_for_decision_tree(df)
+        random_forest_df = preprocess_for_random_forest(df)
+        
         # Make predictions
-        predictions = model.predict(df)
+        logistic_preds = logistic_model.predict(logistic_df)
+        decision_preds = decision_tree_model.predict(decision_df)
+        random_forest_preds = random_forest_model.predict(random_forest_df)
         
-        # Count reconnaissance attacks
-        reconnaissance_count = sum(1 for pred in predictions if 'Reconnaissance' in str(pred))
-        total_entries = len(predictions)
-        percentage = round((reconnaissance_count / total_entries) * 100, 2) if total_entries > 0 else 0
+        # Count reconnaissance attacks for each model
+        # Logistic returns text labels
+        logistic_recon_count = sum(1 for pred in logistic_preds if 'Reconnaissance' in str(pred))
+        # Decision tree returns numeric labels (1 = Reconnaissance, 0 = none)
+        decision_recon_count = sum(1 for pred in decision_preds if pred == 1)
+        # Random forest returns text labels
+        random_forest_recon_count = sum(1 for pred in random_forest_preds if 'Reconnaissance' in str(pred))
         
-        # Get up to 5 examples of reconnaissance attacks
-        reconnaissance_indices = [i for i, pred in enumerate(predictions) if 'Reconnaissance' in str(pred)]
-        examples = df.iloc[reconnaissance_indices[:5]].to_dict('records') if reconnaissance_indices else []
+        total_entries = len(logistic_preds)
+        logistic_percentage = round((logistic_recon_count / total_entries) * 100, 2) if total_entries > 0 else 0
+        decision_percentage = round((decision_recon_count / total_entries) * 100, 2) if total_entries > 0 else 0
+        random_forest_percentage = round((random_forest_recon_count / total_entries) * 100, 2) if total_entries > 0 else 0
+        
+        # Get up to 5 examples of reconnaissance attacks for each model
+        logistic_indices = [i for i, pred in enumerate(logistic_preds) if 'Reconnaissance' in str(pred)]
+        decision_indices = [i for i, pred in enumerate(decision_preds) if pred == 1]
+        random_forest_indices = [i for i, pred in enumerate(random_forest_preds) if 'Reconnaissance' in str(pred)]
+        logistic_examples = df_examples.iloc[logistic_indices[:5]].to_dict('records') if logistic_indices else []
+        decision_examples = df_examples.iloc[decision_indices[:5]].to_dict('records') if decision_indices else []
+        random_forest_examples = df_examples.iloc[random_forest_indices[:5]].to_dict('records') if random_forest_indices else []
         
         # Clean up uploaded file
         os.remove(filepath)
         
         return render_template('index.html', 
                              results=True,
-                             reconnaissance_count=reconnaissance_count,
                              total_entries=total_entries,
-                             percentage=percentage,
-                             examples=examples)
+                             logistic_reconnaissance_count=logistic_recon_count,
+                             logistic_percentage=logistic_percentage,
+                             decision_reconnaissance_count=decision_recon_count,
+                             decision_percentage=decision_percentage,
+                             random_forest_reconnaissance_count=random_forest_recon_count,
+                             random_forest_percentage=random_forest_percentage,
+                             logistic_examples=logistic_examples,
+                             decision_examples=decision_examples,
+                             random_forest_examples=random_forest_examples)
     
     except Exception as e:
         # Clean up on error
@@ -103,26 +230,30 @@ def predict():
         else:
             return jsonify({'error': 'Invalid data format. Expected dict or list of dicts'}), 400
 
+        # Apply preprocessing for both models
+        logistic_df = preprocess_for_logistic(df)
+        decision_df = preprocess_for_decision_tree(df)
+        
         # Make predictions
-        predictions = model.predict(df)
+        logistic_preds = logistic_model.predict(logistic_df)
+        decision_preds = decision_tree_model.predict(decision_df)
 
-        # Get prediction probabilities if the model supports it
+        # Get prediction probabilities for the logistic pipeline if supported
         try:
-            probabilities = model.predict_proba(df)
-            # Get the classes from the model
-            classes = model.classes_
+            logistic_probabilities = logistic_model.predict_proba(logistic_df)
+            logistic_classes = logistic_model.classes_
         except:
-            probabilities = None
-            classes = None
+            logistic_probabilities = None
+            logistic_classes = None
 
-        # Prepare response
         response = {
-            'predictions': predictions.tolist()
+            'logistic_predictions': logistic_preds.tolist(),
+            'decision_tree_predictions': decision_preds.tolist(),
         }
 
-        if probabilities is not None and classes is not None:
-            response['probabilities'] = probabilities.tolist()
-            response['classes'] = classes.tolist()
+        if logistic_probabilities is not None and logistic_classes is not None:
+            response['logistic_probabilities'] = logistic_probabilities.tolist()
+            response['logistic_classes'] = logistic_classes.tolist()
 
         return jsonify(response)
 
@@ -138,6 +269,7 @@ def health():
 def model_info():
     """Display comprehensive information about the loaded model"""
     try:
+        print(type(model).__name__)
         html_content = f"""
         <!DOCTYPE html>
         <html>
@@ -164,7 +296,7 @@ def model_info():
             <div class="container">
                 <h1>🔍 SIEM Model Analysis Dashboard</h1>
                 <p><strong>Model Type:</strong> {type(model).__name__}</p>
-                <p><strong>Model Path:</strong> {MODEL_PATH}</p>
+                <p><strong>Model Path:</strong> {LOGISTIC_MODEL_PATH}</p>
         """
 
         # Pipeline information

@@ -104,19 +104,29 @@
         {% if results %}
         <div class="results">
             <h2>Analysis Results</h2>
-            <p><strong>Reconnaissance Attacks Detected:</strong> {{ reconnaissance_count }}</p>
             <p><strong>Total Entries:</strong> {{ total_entries }}</p>
-            <p><strong>Percentage:</strong> {{ percentage }}%</p>
-            {% if reconnaissance_count > 0 %}
-            <div class="success">⚠️ Potential reconnaissance activity found!</div>
-            {% else %}
-            <div class="success">✅ No reconnaissance attacks detected.</div>
-            {% endif %}
+            <div style="display: flex; flex-wrap: wrap; gap: 20px;">
+                <div style="flex: 1; min-width: 280px; background: #eef6fb; padding: 15px; border-radius: 8px;">
+                    <h3>Logistic Regression</h3>
+                    <p><strong>Reconnaissance Attacks Detected:</strong> {{ logistic_reconnaissance_count }}</p>
+                    <p><strong>Percentage:</strong> {{ logistic_percentage }}%</p>
+                </div>
+                <div style="flex: 1; min-width: 280px; background: #f7f4ee; padding: 15px; border-radius: 8px;">
+                    <h3>Decision Tree</h3>
+                    <p><strong>Reconnaissance Attacks Detected:</strong> {{ decision_reconnaissance_count }}</p>
+                    <p><strong>Percentage:</strong> {{ decision_percentage }}%</p>
+                </div>
+                <div style="flex: 1; min-width: 280px; background: #f0eed7; padding: 15px; border-radius: 8px;">
+                    <h3>Random Forest</h3>
+                    <p><strong>Reconnaissance Attacks Detected:</strong> {{ random_forest_reconnaissance_count }}</p>
+                    <p><strong>Percentage:</strong> {{ random_forest_percentage }}%</p>
+                </div>
+            </div>
         </div>
         
-        {% if examples %}
+        {% if logistic_examples %}
         <div class="examples">
-            <h3>Example Reconnaissance Entries</h3>
+            <h3>Logistic Regression Reconnaissance Examples</h3>
             <table>
                 <tr>
                     <th>Source IP</th>
@@ -127,7 +137,7 @@
                     <th>Service</th>
                     <th>Datetime</th>
                 </tr>
-                {% for ex in examples %}
+                {% for ex in logistic_examples %}
                 <tr>
                     <td>{{ ex.get('src_ip', '') }}</td>
                     <td>{{ ex.get('dest_ip', '') }}</td>
@@ -141,6 +151,63 @@
             </table>
         </div>
         {% endif %}
+
+        {% if decision_examples %}
+        <div class="examples">
+            <h3>Decision Tree Reconnaissance Examples</h3>
+            <table>
+                <tr>
+                    <th>Source IP</th>
+                    <th>Dest IP</th>
+                    <th>Source Port</th>
+                    <th>Dest Port</th>
+                    <th>Protocol</th>
+                    <th>Service</th>
+                    <th>Datetime</th>
+                </tr>
+                {% for ex in decision_examples %}
+                <tr>
+                    <td>{{ ex.get('src_ip', '') }}</td>
+                    <td>{{ ex.get('dest_ip', '') }}</td>
+                    <td>{{ ex.get('src_port', '') }}</td>
+                    <td>{{ ex.get('dest_port', '') }}</td>
+                    <td>{{ ex.get('protocol', '') }}</td>
+                    <td>{{ ex.get('service', '') }}</td>
+                    <td>{{ ex.get('datetime', '') }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+        {% endif %}
+
+        {% if random_forest_examples %}
+        <div class="examples">
+            <h3>Random Forest Reconnaissance Examples</h3>
+            <table>
+                <tr>
+                    <th>Source IP</th>
+                    <th>Dest IP</th>
+                    <th>Source Port</th>
+                    <th>Dest Port</th>
+                    <th>Protocol</th>
+                    <th>Service</th>
+                    <th>Datetime</th>
+                </tr>
+                {% for ex in random_forest_examples %}
+                <tr>
+                    <td>{{ ex.get('src_ip', '') }}</td>
+                    <td>{{ ex.get('dest_ip', '') }}</td>
+                    <td>{{ ex.get('src_port', '') }}</td>
+                    <td>{{ ex.get('dest_port', '') }}</td>
+                    <td>{{ ex.get('protocol', '') }}</td>
+                    <td>{{ ex.get('service', '') }}</td>
+                    <td>{{ ex.get('datetime', '') }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+        {% endif %}
+
         {% endif %}
     </div>
 </body>
