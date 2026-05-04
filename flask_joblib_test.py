@@ -11,9 +11,9 @@ import os
 
 TRAINING_DATA_PATH = Path(__file__).parent / "Datasets" / "part-00000-0af89d10-df53-44fd-b124-a8a496fd5023-c000(2).csv"
 EXCLUDE_COLUMNS = {"dest_ip", "src_ip", "uid", "community_id", "datetime", "ts"}
-LOGISTIC_MODEL_PATH = Path(__file__).parent / "Models" / "siem_logistic_model-3.joblib"
-DECISION_TREE_MODEL_PATH = Path(__file__).parent / "Models" / "decision_tree_model.joblib"
-RANDOM_FOREST_MODEL_PATH = Path(__file__).parent / "Models" / "trained_ml_model_random_forest_2.joblib"
+LOGISTIC_MODEL_PATH = Path(__file__).parent / "Models" / "logistic_regression_combined_output.joblib"
+DECISION_TREE_MODEL_PATH = Path(__file__).parent / "Models" / "decision_tree_combined_output.joblib"
+RANDOM_FOREST_MODEL_PATH = Path(__file__).parent / "Models" / "random_forest_combined_output.joblib"
 
 
 def engineer_features(df):
@@ -37,72 +37,162 @@ def engineer_features(df):
     return df
 
 
-def build_decision_tree_encoders():
-    df = pd.read_csv(TRAINING_DATA_PATH)
+def keep_model_columns(df, model):
+    """Keep only columns expected by the trained model and drop unseen uploaded columns."""
+    if not hasattr(model, 'feature_names_in_'):
+        return df
+    required_columns = list(model.feature_names_in_)
+    return df.loc[:, df.columns.intersection(required_columns)]
+
+
+def preprocess_for_logistic(df):
+    """
+    Preprocess data for Logistic Regression model.
+    Matches the preprocessing from SOCLogsLogisticRegression.ipynb
+    """
+    df = df.copy()
+
+    # Remove target column if present
     if 'mitre_attack_tactics' in df.columns:
         df = df.drop(columns=['mitre_attack_tactics'])
+
+    # Drop excluded columns
     df = df.drop(columns=[col for col in EXCLUDE_COLUMNS if col in df.columns], errors='ignore')
 
+    # Convert numeric-looking strings to numbers
     for col in df.columns:
         if df[col].dtype == object:
             converted = pd.to_numeric(df[col], errors='coerce')
             if converted.notna().sum() > len(df) * 0.75:
                 df[col] = converted
 
+    # Apply feature engineering
     df = engineer_features(df)
-    encoders = {}
-    for col in df.columns:
-        if not pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_bool_dtype(df[col]):
-            encoder = LabelEncoder()
-            encoder.fit(df[col].astype(str))
-            encoders[col] = encoder
-    return encoders
 
+    # Handle missing values in categorical features
+    categorical_features = df.select_dtypes(include=["object", "bool", "category"]).columns.tolist()
+    if categorical_features:
+        df[categorical_features] = df[categorical_features].fillna("missing")
 
-DECISION_TREE_ENCODERS = build_decision_tree_encoders()
-
-
-def preprocess_for_logistic(df):
-    df = df.copy()
-    if 'mitre_attack_tactics' in df.columns:
-        df = df.drop(columns=['mitre_attack_tactics'])
-    df = df.drop(columns=[col for col in EXCLUDE_COLUMNS if col in df.columns], errors='ignore')
-    df = engineer_features(df)
     return df
 
 
 def preprocess_for_decision_tree(df):
+    """
+    Preprocess data for Decision Tree model.
+    Matches the preprocessing from SOCDecisionTree.ipynb exactly
+    """
     df = df.copy()
+
+    # Remove target column if present
     if 'mitre_attack_tactics' in df.columns:
         df = df.drop(columns=['mitre_attack_tactics'])
+
+    # Drop excluded columns
     df = df.drop(columns=[col for col in EXCLUDE_COLUMNS if col in df.columns], errors='ignore')
 
-    for col in df.columns:
-        if df[col].dtype == object:
-            converted = pd.to_numeric(df[col], errors='coerce')
-            if converted.notna().sum() > len(df) * 0.75:
-                df[col] = converted
+    # Define the exact features used in the Decision Tree notebook
+    numerical_features = [
+        'resp_pkts', 'orig_ip_bytes', 'missed_bytes', 'duration',
+        'orig_pkts', 'resp_ip_bytes', 'dest_port', 'orig_bytes', 'resp_bytes', 'src_port'
+    ]
+    categorical_features = [
+        'service', 'protocol', 'conn_state', 'local_resp', 'local_orig'
+    ]
 
-    df = engineer_features(df)
+    # Keep only the features used in training
+    features = numerical_features + categorical_features
+    df = df[features].copy()
 
-    for col, encoder in DECISION_TREE_ENCODERS.items():
-        if col in df.columns:
-            df[col] = df[col].astype(str)
-            unseen = set(df[col].unique()) - set(encoder.classes_)
-            if unseen:
-                raise ValueError(f"Unseen label values for column '{col}': {sorted(unseen)}")
-            df[col] = encoder.transform(df[col])
+    # Apply feature engineering (exactly as in the notebook)
+    df['total_pkts'] = df['orig_pkts'] + df['resp_pkts']
+    df['total_bytes'] = df['orig_bytes'] + df['resp_bytes']
+    df['pkt_ratio'] = df['resp_pkts'] / df['total_pkts'].replace(0, np.nan)
+    df['byte_ratio'] = df['resp_bytes'] / df['total_bytes'].replace(0, np.nan)
+    df[['pkt_ratio', 'byte_ratio']] = df[['pkt_ratio', 'byte_ratio']].fillna(0)
+    df['pkt_rate'] = df['total_pkts'] / df['duration'].replace(0, np.nan)
+    df['byte_rate'] = df['total_bytes'] / df['duration'].replace(0, np.nan)
+    df[['pkt_rate', 'byte_rate']] = df[['pkt_rate', 'byte_rate']].replace([np.inf, -np.inf], 0).fillna(0)
+
+    # Handle missing values in categorical features
+    for cat_col in categorical_features:
+        if cat_col in df.columns:
+            df[cat_col] = df[cat_col].fillna('missing')
+
+    # Create one-hot encoded features manually to match training exactly
+    # Based on the combined training data categories
+
+    # Service encoding (reference: dhcp, so we create dns and ntp)
+    df['service_dns'] = (df['service'] == 'dns').astype(int)
+    df['service_ntp'] = (df['service'] == 'ntp').astype(int)
+
+    # Protocol encoding (reference: icmp, so we don't create icmp but create others)
+    # The model expects protocol_udp but not protocol_tcp, so protocol_udp=1 when protocol='udp'
+    df['protocol_udp'] = (df['protocol'] == 'udp').astype(int)
+
+    # Conn_state encoding (reference: OTH, so we create SF and SHR)
+    df['conn_state_SF'] = (df['conn_state'] == 'SF').astype(int)
+    df['conn_state_SHR'] = (df['conn_state'] == 'SHR').astype(int)
+
+    # Local_resp and local_orig (boolean to int)
+    df['local_resp_True'] = df['local_resp'].astype(int)
+    df['local_orig_True'] = df['local_orig'].astype(int)
+
+    # Drop the original categorical columns
+    df = df.drop(columns=categorical_features)
+
+    # Ensure all expected features are present (add missing ones as 0)
+    expected_features = [
+        'resp_pkts', 'orig_ip_bytes', 'missed_bytes', 'duration', 'orig_pkts',
+        'resp_ip_bytes', 'dest_port', 'orig_bytes', 'resp_bytes', 'src_port',
+        'total_pkts', 'total_bytes', 'pkt_ratio', 'byte_ratio', 'pkt_rate', 'byte_rate',
+        'service_dns', 'service_ntp', 'protocol_udp', 'conn_state_SF', 'conn_state_SHR',
+        'local_resp_True', 'local_orig_True'
+    ]
+
+    for feature in expected_features:
+        if feature not in df.columns:
+            df[feature] = 0
+
+    # Reorder columns to match expected order
+    df = df[expected_features]
 
     return df
 
 
 def preprocess_for_random_forest(df):
-    """Preprocess for random forest (Pipeline handles its own encoding)"""
+    """
+    Preprocess data for Random Forest model.
+    Matches the preprocessing from SOCTransformers.ipynb
+    """
     df = df.copy()
+
+    # Remove target column if present
     if 'mitre_attack_tactics' in df.columns:
         df = df.drop(columns=['mitre_attack_tactics'])
-    #df = df.drop(columns=[col for col in EXCLUDE_COLUMNS if col in df.columns], errors='ignore')
+
+    # Apply feature engineering first
     df = engineer_features(df)
+
+    # Drop excluded columns (done after feature engineering in the notebook)
+    df = df.drop(columns=[col for col in EXCLUDE_COLUMNS if col in df.columns], errors='ignore')
+
+    # Identify feature types (like in the notebook)
+    numerical_features = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    categorical_features = df.select_dtypes(include='object').columns.tolist()
+    boolean_features = df.select_dtypes(include='bool').columns.tolist()
+    categorical_features.extend(boolean_features)
+
+    # Refine categorical features: numerical columns with few unique values
+    for col in numerical_features.copy():
+        if df[col].nunique() < 10 and df[col].dtype == 'int64':
+            categorical_features.append(col)
+            numerical_features.remove(col)
+
+    # Handle missing values
+    if categorical_features:
+        df[categorical_features] = df[categorical_features].fillna(df[categorical_features].mode().iloc[0])
+
     return df
 
 
@@ -120,8 +210,10 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 logistic_model = joblib.load(LOGISTIC_MODEL_PATH)
 decision_tree_model = joblib.load(DECISION_TREE_MODEL_PATH)
 random_forest_model = joblib.load(RANDOM_FOREST_MODEL_PATH)
+
 # Keep a default model alias for existing model-info behavior
 model = logistic_model
+
 
 @app.route('/')
 def index():
@@ -156,8 +248,13 @@ def upload_file():
         
         # Preprocess for each model
         logistic_df = preprocess_for_logistic(df)
+        logistic_df = keep_model_columns(logistic_df, logistic_model)
+
         decision_df = preprocess_for_decision_tree(df)
+        decision_df = keep_model_columns(decision_df, decision_tree_model)
+
         random_forest_df = preprocess_for_random_forest(df)
+        random_forest_df = keep_model_columns(random_forest_df, random_forest_model)
         
         # Make predictions
         logistic_preds = logistic_model.predict(logistic_df)
@@ -210,7 +307,7 @@ def upload_file():
 @app.route('/predict', methods=['POST'])
 def predict():
     """
-    Endpoint to make predictions using the SIEM logistic model.
+    Endpoint to make predictions using the SOC logistic model.
     Expects JSON input with features similar to the training data.
     """
     try:
@@ -230,13 +327,20 @@ def predict():
         else:
             return jsonify({'error': 'Invalid data format. Expected dict or list of dicts'}), 400
 
-        # Apply preprocessing for both models
+        # Apply preprocessing for each model
         logistic_df = preprocess_for_logistic(df)
+        logistic_df = keep_model_columns(logistic_df, logistic_model)
+
         decision_df = preprocess_for_decision_tree(df)
+        decision_df = keep_model_columns(decision_df, decision_tree_model)
+
+        random_forest_df = preprocess_for_random_forest(df)
+        random_forest_df = keep_model_columns(random_forest_df, random_forest_model)
         
         # Make predictions
         logistic_preds = logistic_model.predict(logistic_df)
         decision_preds = decision_tree_model.predict(decision_df)
+        random_forest_preds = random_forest_model.predict(random_forest_df)
 
         # Get prediction probabilities for the logistic pipeline if supported
         try:
@@ -249,6 +353,7 @@ def predict():
         response = {
             'logistic_predictions': logistic_preds.tolist(),
             'decision_tree_predictions': decision_preds.tolist(),
+            'random_forest_predictions': random_forest_preds.tolist(),
         }
 
         if logistic_probabilities is not None and logistic_classes is not None:
@@ -274,7 +379,7 @@ def model_info():
         <!DOCTYPE html>
         <html>
         <head>
-            <title>SIEM Model Information</title>
+            <title>SOC Model Information</title>
             <style>
                 body {{ font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }}
                 .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
@@ -294,7 +399,7 @@ def model_info():
         </head>
         <body>
             <div class="container">
-                <h1>🔍 SIEM Model Analysis Dashboard</h1>
+                <h1>🔍 SOC Model Analysis Dashboard</h1>
                 <p><strong>Model Type:</strong> {type(model).__name__}</p>
                 <p><strong>Model Path:</strong> {LOGISTIC_MODEL_PATH}</p>
         """
@@ -414,7 +519,7 @@ def model_info():
             <h2>📈 Model Performance</h2>
             <div class="section">
                 <p><strong>Note:</strong> For detailed performance metrics, run the training script.</p>
-                <p><strong>Classification Task:</strong> The model distinguishes between SIEM events:</p>
+                <p><strong>Classification Task:</strong> The model distinguishes between SOC events:</p>
                 <ul>
         """
 
